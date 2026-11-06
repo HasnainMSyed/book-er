@@ -25,3 +25,6 @@ dist-ssr
 
 # Copied from node_modules by scripts/copy-pdfjs-assets.mjs
 public/pdfjs
+
+# Personal test books, never committed
+test-pdfs/

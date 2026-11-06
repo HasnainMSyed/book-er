@@ -44,7 +44,7 @@ async function readLines(page: PageLike): Promise<PageLines> {
   const [x0, y0, x1, y1] = page.view
   const content = await page.getTextContent()
   const lines: Line[] = []
-  let cur: (Line & { space: boolean }) | null = null
+  let cur: (Line & { space: boolean; mainLength: number }) | null = null
 
   const push = () => {
     if (cur) {
@@ -54,8 +54,10 @@ async function readLines(page: PageLike): Promise<PageLines> {
     cur = null
   }
 
-  for (const item of content.items) {
-    if (!('str' in item)) continue
+  const skip = findDuplicateDraws(content.items)
+
+  for (const [index, item] of content.items.entries()) {
+    if (!('str' in item) || skip.has(index)) continue
     const t = item.transform as number[]
     // Skip rotated text (stamps, sideways margin notes).
     if (Math.abs(t[1]) > 0.01 * Math.abs(t[0] || 1)) continue
@@ -70,28 +72,71 @@ async function readLines(page: PageLike): Promise<PageLines> {
 
     const x = t[4]
     const y = t[5]
-    const sameLine: boolean =
-      cur !== null && Math.abs(y - cur.y) < Math.max(size, cur.size) * 0.5 && x > cur.x - size
+    // Same line = about the same height AND carrying on to the right. Text that
+    // jumps back to the left is the next line, even if it sits very close
+    // (like the first line of a chapter right under its big heading).
+    const maxSize = cur ? Math.max(size, cur.size) : size
+    const sameLine: boolean = cur !== null && Math.abs(y - cur.y) < maxSize * 0.5 && x > cur.xEnd - maxSize
     if (cur && sameLine) {
       const gap = x - cur.xEnd
       if (!cur.text.endsWith(' ') && !s.startsWith(' ') && (cur.space || gap > size * 0.15)) cur.text += ' '
       cur.text += s
       cur.xEnd = Math.max(cur.xEnd, x + item.width)
-      // Superscripts and footnote marks shouldn't change the line's size.
-      if (size > cur.size) {
+      // The line's size comes from its longest piece of text, so a big first
+      // letter (drop cap) or a tiny footnote mark doesn't change it.
+      if (s.length > cur.mainLength) {
+        cur.mainLength = s.length
         cur.size = size
         cur.y = y
       }
       cur.space = false
     } else {
       push()
-      cur = { text: s, x, xEnd: x + item.width, y, size, space: false }
+      cur = { text: s, x, xEnd: x + item.width, y, size, space: false, mainLength: s.length }
     }
     if (item.hasEOL) push()
   }
   push()
 
   return { lines, top: Math.max(y0, y1), bottom: Math.min(y0, y1), width: Math.abs(x1 - x0), height: Math.abs(y1 - y0) }
+}
+
+type TextPiece = { str: string; transform: number[]; width: number; height: number }
+
+/**
+ * Some PDFs print the same text several times, slightly offset, to fake bold
+ * or a shadow. Real text never shares its spot on a line with other text, so
+ * any piece that sits inside a longer matching piece on the same line is a copy.
+ */
+function findDuplicateDraws(items: readonly unknown[]): Set<number> {
+  const pieces = items
+    .map((it, index) => ({ it: it as TextPiece, index }))
+    .filter(({ it }) => typeof it.str === 'string' && it.str.trim() !== '')
+    .map(({ it, index }) => ({
+      index,
+      str: it.str.trim(),
+      x: it.transform[4],
+      y: it.transform[5],
+      w: it.width,
+      size: Math.abs(it.transform[3]) || it.height || 1,
+    }))
+  // Longest first, so the fullest copy is the one kept.
+  pieces.sort((a, b) => b.str.length - a.str.length || a.index - b.index)
+  const kept: typeof pieces = []
+  const skip = new Set<number>()
+  for (const p of pieces) {
+    const tol = p.size * 0.6
+    const copy = kept.some(
+      (k) =>
+        Math.abs(k.y - p.y) < tol &&
+        p.x >= k.x - tol &&
+        p.x + p.w <= k.x + k.w + tol &&
+        k.str.includes(p.str),
+    )
+    if (copy) skip.add(p.index)
+    else kept.push(p)
+  }
+  return skip
 }
 
 // ---------- 2. headers, footers, page numbers ----------
@@ -119,7 +164,8 @@ function removeHeadersAndFooters(pages: PageLines[]) {
       counts.set(key, (counts.get(key) ?? 0) + 1)
     }
   }
-  const repeatThreshold = Math.max(3, Math.round(pages.length * 0.08))
+  // Chapter-specific headers may only repeat across a few pages.
+  const repeatThreshold = 3
 
   for (const p of pages) {
     const drop = new Set(
@@ -190,7 +236,21 @@ function measure(pages: PageLines[]) {
 
 // ---------- 4 & 5. paragraphs ----------
 
-const ENDS_SENTENCE = /[.!?…:;"”’)\]*]$/
+const ENDS_SENTENCE = /[.!?…:;"”’)\]*—–]$/
+
+/** Ends a sentence, ignoring a footnote number after it ("…any minute’.4"). */
+function endsSentence(text: string) {
+  return ENDS_SENTENCE.test(text.replace(/([.!?…"”’)])\s?[\d*†‡]{1,3}$/u, '$1'))
+}
+
+/** A short "Chapter 3" / "PART TWO" label printed above a chapter title. */
+const CHAPTER_LABEL = /^(chapter|part|book|section)\s+[\p{L}\d]{1,12}\.?$/iu
+
+/** "1. ", "a) ", "• " at the start of a line. */
+const LIST_ITEM = /^(\d{1,3}[.)]|\(?[a-z]\)|[•●▪■◦∙‣])\s/u
+const BULLET = /^[•●▪■◦∙‣]\s/u
+/** The previous line could end a list item ("...rewards," / "...today;"). */
+const ENDS_ITEM = /[.,;:!?)”’"]$/
 
 /** Marks a line-end hyphen we can't judge yet ("waistcoat-" + "pocket" or "won-" + "derful"). */
 const MAYBE_HYPHEN = ''
@@ -238,7 +298,7 @@ function firstWordWidth(next: Line) {
 function buildBlocks(pages: PageLines[]): Block[] {
   const { bodySize, lineGap, margins } = measure(pages)
   const blocks: Block[] = []
-  let para: { text: string; page: number } | null = null
+  let para: { text: string; page: number; x: number; list: boolean } | null = null
   let prev: { line: Line; right: number; heading: boolean } | null = null
 
   const flush = () => {
@@ -260,9 +320,18 @@ function buildBlocks(pages: PageLines[]): Block[] {
     p.lines.forEach((line, i) => {
       const isHeading = line.size > bodySize * 1.18 && line.text.length < 150
 
-      // Big decorative first letter ("drop cap"): glue it to the next line.
-      if (isHeading && line.text.length <= 2 && /\p{L}/u.test(line.text) && p.lines[i + 1]) {
-        p.lines[i + 1] = { ...p.lines[i + 1], text: line.text + p.lines[i + 1].text }
+      // Big decorative first letter ("drop cap") on its own line, with the
+      // text continuing to its right: glue it to the next line.
+      const next = p.lines[i + 1]
+      if (
+        isHeading &&
+        line.text.length <= 2 &&
+        /\p{L}/u.test(line.text) &&
+        next &&
+        line.size > bodySize * 1.8 &&
+        next.x >= line.xEnd - 1
+      ) {
+        p.lines[i + 1] = { ...next, text: line.text + next.text }
         return
       }
 
@@ -270,7 +339,11 @@ function buildBlocks(pages: PageLines[]): Block[] {
         flush()
         const last = blocks[blocks.length - 1]
         if (prev?.heading && last?.t === 'h' && last.page === pageNum) last.text = joinLines(last.text, line.text)
-        else blocks.push({ t: 'h', text: line.text, page: pageNum })
+        else if (last?.t === 'p' && last.page === pageNum && CHAPTER_LABEL.test(last.text)) {
+          // "CHAPTER 3" just above "Don't Feel Their Pain" → one heading.
+          const sep = /[.:]$/.test(last.text) ? ' ' : ': '
+          blocks[blocks.length - 1] = { t: 'h', text: last.text + sep + line.text, page: pageNum }
+        } else blocks.push({ t: 'h', text: line.text, page: pageNum })
         prev = { line, right, heading: true }
         return
       }
@@ -282,21 +355,39 @@ function buildBlocks(pages: PageLines[]): Block[] {
         const room = prev.right - prev.line.xEnd
         const endedEarly =
           room > firstWordWidth(line) + bodySize * 0.6 &&
-          (ENDS_SENTENCE.test(prev.line.text) || room > (right - left) * 0.25)
+          (endsSentence(prev.line.text) || room > (right - left) * 0.25)
         // First-line indent. A full line at the same indent is the next line of
         // an indented block (like a quotation), not a new paragraph.
         const indent = line.x - left
         const indented = indent > bodySize * 0.7 && indent < (right - left) * 0.35
         const sameIndentAsPrev = Math.abs(line.x - prev.line.x) <= 1
         const sameColumnGap = i > 0 ? prev.line.y - line.y : 0
-        if (endedEarly) newPara = true
-        else if (indented && !sameIndentAsPrev) newPara = true
+        // A new bullet, or a number after a line that could end the last item.
+        const startsItem =
+          BULLET.test(line.text) || (LIST_ITEM.test(line.text) && ENDS_ITEM.test(prev.line.text))
+        // The wrapped second line of a list item sits under the item's text,
+        // indented past its number or bullet.
+        const continuesItem = para?.list && line.x > (para?.x ?? 0) + bodySize * 0.3
+        // Centered lines (pull quotes, captions) that follow each other
+        // closely belong together, even though each one starts and ends early.
+        const centered = (l: Line) => {
+          const leftGap = l.x - left
+          const rightGap = right - l.xEnd
+          return leftGap > bodySize && rightGap > bodySize && Math.abs(leftGap - rightGap) < bodySize * 1.5
+        }
+        const normalGap = i > 0 && sameColumnGap > 0 && sameColumnGap <= lineGap * 1.45
+        const centeredBlock = normalGap && centered(prev.line) && centered(line) && !startsItem
+        if (centeredBlock) newPara = false
+        else if (endedEarly || startsItem) newPara = true
+        // An indented line only starts a paragraph if the line before ended a
+        // sentence; otherwise it's the ragged next line of a quote box.
+        else if (indented && !sameIndentAsPrev && !continuesItem && endsSentence(prev.line.text)) newPara = true
         else if (i > 0 && (sameColumnGap > lineGap * 1.45 || sameColumnGap < -bodySize)) newPara = true
       }
 
       if (newPara) {
         flush()
-        para = { text: line.text, page: pageNum }
+        para = { text: line.text, page: pageNum, x: line.x, list: LIST_ITEM.test(line.text) }
       } else if (para) {
         para.text = joinLines(para.text, line.text)
       }

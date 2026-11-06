@@ -111,11 +111,7 @@ export async function processBook(id: string) {
     const mode: ReadMode = text.scannedRatio > 0.5 && !book?.lastOpenedAt ? 'page' : (book?.mode ?? 'reflow')
     await patchBook(id, { status: 'ready', processed: 1, scannedRatio: text.scannedRatio, mode, error: undefined })
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
-    await patchBook(id, {
-      status: 'error',
-      error: /password/i.test(message) ? 'This PDF is password-protected.' : message,
-    })
+    await patchBook(id, { status: 'error', error: friendlyError(err) })
   } finally {
     running.delete(id)
     void closePdf(doc)
@@ -161,6 +157,22 @@ export async function markOpened(id: string) {
 }
 
 // ---------- helpers ----------
+
+/** Turns pdf.js errors into something a reader can act on. */
+function friendlyError(err: unknown): string {
+  const name = err instanceof Error ? err.name : ''
+  const message = err instanceof Error ? err.message : String(err)
+  if (name === 'PasswordException' || /password/i.test(message)) {
+    return 'This PDF is password-protected, so it can’t be opened.'
+  }
+  if (name === 'InvalidPDFException' || /invalid pdf|unexpected end|missing pdf/i.test(message)) {
+    return 'This file is incomplete or damaged — it may not have finished downloading or saving. Try saving or downloading it again.'
+  }
+  if (/is not a function|is not defined/i.test(message)) {
+    return `This browser is too old to open PDFs here. On iPhone, update to iOS 17.4 or newer. (${message})`
+  }
+  return `This PDF couldn’t be read. (${message})`
+}
 
 /** crypto.randomUUID only exists on https pages, so fall back for local testing. */
 function newId() {
