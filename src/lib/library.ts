@@ -1,5 +1,5 @@
 import { db, type BookMeta, type Progress, type ReadMode } from './db'
-import { extractBook } from './extract'
+import { EXTRACT_VERSION, extractBook } from './extract'
 import { closePdf, openPdf, renderCover } from './pdf'
 
 // ---------- change notifications ----------
@@ -78,6 +78,9 @@ export async function processBook(id: string) {
   if (running.has(id)) return
   running.add(id)
   let doc: Awaited<ReturnType<typeof openPdf>> | null = null
+  // A book that's already readable is being re-prepared with better extraction.
+  // It stays readable throughout, and keeps its old text if anything fails.
+  const upgrading = (await getBook(id))?.status === 'ready'
   try {
     const file = await getFile(id)
     if (!file) throw new Error('The PDF file is missing.')
@@ -87,7 +90,8 @@ export async function processBook(id: string) {
     const raw = (info?.info ?? {}) as { Title?: unknown; Author?: unknown }
     const title = cleanTitle(typeof raw.Title === 'string' ? raw.Title : '')
     const author = typeof raw.Author === 'string' ? raw.Author.trim() : ''
-    const cover = await renderCover(doc)
+    const existing = await getBook(id)
+    const cover = upgrading && existing?.cover ? existing.cover : await renderCover(doc)
     await patchBook(id, {
       pageCount: doc.numPages,
       cover,
@@ -101,7 +105,7 @@ export async function processBook(id: string) {
       // Saving every update would be slow; a few times a second is plenty.
       if (Date.now() - lastSaved < 400) return
       lastSaved = Date.now()
-      void patchBook(id, { processed: fraction }).then(notify)
+      if (!upgrading) void patchBook(id, { processed: fraction }).then(notify)
     })
 
     const d = await db()
@@ -109,9 +113,18 @@ export async function processBook(id: string) {
     // Mostly scanned books read better as original pages until we support OCR.
     const book = await getBook(id)
     const mode: ReadMode = text.scannedRatio > 0.5 && !book?.lastOpenedAt ? 'page' : (book?.mode ?? 'reflow')
-    await patchBook(id, { status: 'ready', processed: 1, scannedRatio: text.scannedRatio, mode, error: undefined })
+    await patchBook(id, {
+      status: 'ready',
+      processed: 1,
+      scannedRatio: text.scannedRatio,
+      mode,
+      error: undefined,
+      extractVersion: EXTRACT_VERSION,
+    })
   } catch (err) {
-    await patchBook(id, { status: 'error', error: friendlyError(err) })
+    // Upgrade failed: keep the old text, and don't retry on every launch.
+    if (upgrading) await patchBook(id, { extractVersion: EXTRACT_VERSION })
+    else await patchBook(id, { status: 'error', error: friendlyError(err) })
   } finally {
     running.delete(id)
     void closePdf(doc)
@@ -119,10 +132,17 @@ export async function processBook(id: string) {
   }
 }
 
-/** Restarts any book that was still being prepared when the app was closed. */
+/**
+ * Restarts any book that was still being prepared when the app was closed,
+ * then re-prepares books made with an older version of the text extraction.
+ */
 export async function resumeProcessing() {
-  for (const book of await listBooks()) {
+  const books = await listBooks()
+  for (const book of books) {
     if (book.status === 'processing') await processBook(book.id)
+  }
+  for (const book of books) {
+    if (book.status === 'ready' && (book.extractVersion ?? 1) < EXTRACT_VERSION) await processBook(book.id)
   }
 }
 

@@ -14,6 +14,12 @@ import type { PDFDocumentProxy } from './pdf'
 type Line = { text: string; x: number; xEnd: number; y: number; size: number }
 type PageLines = { lines: Line[]; top: number; bottom: number; width: number; height: number }
 
+/**
+ * Bump this whenever a change here would produce better text for books that
+ * were already added. The app then quietly re-prepares those books.
+ */
+export const EXTRACT_VERSION = 2
+
 /** Fraction of a page's height treated as the header/footer zone. */
 const EDGE_ZONE = 0.12
 

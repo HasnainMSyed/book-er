@@ -16,6 +16,8 @@ export type Progress = {
   block: number // first visible block in reflow mode
   page: number // 1-based PDF page
   percent: number // 0..1
+  /** Start of the text at `block`, to find the same spot if the text is re-prepared. */
+  anchor?: string
 }
 
 export type BookMeta = {
@@ -33,6 +35,8 @@ export type BookMeta = {
   processed?: number
   /** Share of pages with no text at all (likely scanned). */
   scannedRatio?: number
+  /** Which version of the text extraction prepared this book (missing = 1). */
+  extractVersion?: number
   cover?: Blob
   mode: ReadMode
   progress: Progress

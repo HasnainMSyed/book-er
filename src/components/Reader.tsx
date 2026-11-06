@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
-import type { BookMeta, BookText, Progress, ReadMode, TocItem } from '../lib/db'
+import type { Block, BookMeta, BookText, Progress, ReadMode, TocItem } from '../lib/db'
 import { getBook, getFile, getText, markOpened, saveMode, saveProgress } from '../lib/library'
 import { closePdf, openPdf, type PDFDocumentProxy } from '../lib/pdf'
 import { FONT_STACKS, MARGINS, useSettings } from '../lib/settings'
@@ -9,6 +9,27 @@ import { ReflowView, type Jump, type ViewHandle } from './ReflowView'
 import { SettingsSheet, TocSheet } from './Sheets'
 
 const ZOOMS = [1, 1.5, 2, 3]
+
+const anchorOf = (b: Block | undefined) => (b && b.t !== 'img' ? b.text.slice(0, 60) : undefined)
+
+/**
+ * Finds your saved spot. Usually that's just the saved paragraph number, but
+ * if the book's text was re-prepared since, paragraphs may be numbered
+ * differently, so look for the text you were reading (or at least its page).
+ */
+function resolvePosition(blocks: Block[], p: Progress): Progress {
+  const at = blocks[p.block]
+  const stillValid = p.anchor ? anchorOf(at) === p.anchor : at?.page === p.page
+  if (stillValid) return p
+  let i = p.anchor ? blocks.findIndex((b) => anchorOf(b) === p.anchor) : -1
+  if (i < 0 && p.anchor) {
+    const anchor = p.anchor
+    i = blocks.findIndex((b) => b.t !== 'img' && b.text.includes(anchor))
+  }
+  if (i < 0) i = blocks.findIndex((b) => b.page >= p.page)
+  if (i < 0) i = Math.max(0, blocks.length - 1)
+  return { ...p, block: i, page: blocks[i]?.page ?? p.page, anchor: anchorOf(blocks[i]) }
+}
 
 export function Reader({ id, onClose }: { id: string; onClose: () => void }) {
   const settings = useSettings()
@@ -33,7 +54,7 @@ export function Reader({ id, onClose }: { id: string; onClose: () => void }) {
       setBook(b)
       setText(t)
       setMode(b.mode)
-      setPos(b.progress)
+      setPos(resolvePosition(t.blocks, b.progress))
       void markOpened(id)
     })
     return () => {
@@ -90,25 +111,38 @@ export function Reader({ id, onClose }: { id: string; onClose: () => void }) {
   const onBlock = useCallback(
     (block: number) => {
       if (!blocks?.length) return
+      const b = Math.min(block, blocks.length - 1)
       setPos({
-        block,
-        page: blocks[Math.min(block, blocks.length - 1)].page,
-        percent: blocks.length > 1 ? block / (blocks.length - 1) : 1,
+        block: b,
+        page: blocks[b].page,
+        percent: blocks.length > 1 ? b / (blocks.length - 1) : 1,
+        anchor: anchorOf(blocks[b]),
       })
     },
     [blocks],
   )
   const onPage = useCallback(
     (page: number) => {
-      setPos({ page, block: firstBlockOnPage(page), percent: pageCount > 1 ? (page - 1) / (pageCount - 1) : 1 })
+      const block = firstBlockOnPage(page)
+      setPos({
+        page,
+        block,
+        percent: pageCount > 1 ? (page - 1) / (pageCount - 1) : 1,
+        anchor: anchorOf(blocks?.[block]),
+      })
     },
-    [firstBlockOnPage, pageCount],
+    [firstBlockOnPage, pageCount, blocks],
   )
 
   const switchMode = (m: ReadMode) => {
     if (m === mode) return
     // Text → page: open the page you were reading. Page → text: start of that page.
-    if (m === 'reflow') setPos((p) => ({ ...p, block: firstBlockOnPage(p.page) }))
+    if (m === 'reflow') {
+      setPos((p) => {
+        const block = firstBlockOnPage(p.page)
+        return { ...p, block, anchor: anchorOf(blocks?.[block]) }
+      })
+    }
     setMode(m)
     setJump(null)
     void saveMode(id, m)
