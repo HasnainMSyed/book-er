@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { createBackup, restoreBackup, saveBackup } from '../lib/backup'
-import type { BookMeta } from '../lib/db'
+import { asBlob, type BookMeta } from '../lib/db'
 import { addBooks, deleteBook, listBooks, onLibraryChange, retryBook, storageUsage } from '../lib/library'
 import { formatBytes } from '../lib/platform'
 import { Icon } from './Icon'
@@ -22,14 +22,15 @@ function useBooks() {
 }
 
 /** Object URL for a cover image, released when no longer shown. */
-function useBlobUrl(blob: Blob | undefined) {
+function useBlobUrl(data: Blob | ArrayBuffer | undefined) {
   const [url, setUrl] = useState<string>()
   useEffect(() => {
+    const blob = asBlob(data, 'image/jpeg')
     if (!blob) return setUrl(undefined)
     const u = URL.createObjectURL(blob)
     setUrl(u)
     return () => URL.revokeObjectURL(u)
-  }, [blob])
+  }, [data])
   return url
 }
 

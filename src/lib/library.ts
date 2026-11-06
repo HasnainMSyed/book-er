@@ -1,4 +1,4 @@
-import { db, type BookMeta, type Progress, type ReadMode } from './db'
+import { asBlob, db, type BookMeta, type Progress, type ReadMode } from './db'
 import { EXTRACT_VERSION, extractBook } from './extract'
 import { closePdf, openPdf, renderCover } from './pdf'
 
@@ -25,7 +25,7 @@ export async function getBook(id: string) {
 }
 
 export async function getFile(id: string) {
-  return (await db()).get('files', id)
+  return asBlob(await (await db()).get('files', id), 'application/pdf')
 }
 
 export async function getText(id: string) {
@@ -62,8 +62,10 @@ export async function addBooks(files: File[]) {
       mode: 'reflow',
       progress: { block: 0, page: 1, percent: 0 },
     }
+    // Read the bytes first: a transaction closes if it waits on anything else.
+    const bytes = await file.arrayBuffer()
     const tx = d.transaction(['books', 'files'], 'readwrite')
-    await Promise.all([tx.objectStore('files').put(file, id), tx.objectStore('books').put(meta), tx.done])
+    await Promise.all([tx.objectStore('files').put(bytes, id), tx.objectStore('books').put(meta), tx.done])
     ids.push(id)
   }
   notify()
@@ -91,7 +93,7 @@ export async function processBook(id: string) {
     const title = cleanTitle(typeof raw.Title === 'string' ? raw.Title : '')
     const author = typeof raw.Author === 'string' ? raw.Author.trim() : ''
     const existing = await getBook(id)
-    const cover = upgrading && existing?.cover ? existing.cover : await renderCover(doc)
+    const cover = upgrading && existing?.cover ? existing.cover : await (await renderCover(doc))?.arrayBuffer()
     await patchBook(id, {
       pageCount: doc.numPages,
       cover,
@@ -124,7 +126,7 @@ export async function processBook(id: string) {
   } catch (err) {
     // Upgrade failed: keep the old text, and don't retry on every launch.
     if (upgrading) await patchBook(id, { extractVersion: EXTRACT_VERSION })
-    else await patchBook(id, { status: 'error', error: friendlyError(err) })
+    else await patchBook(id, { status: 'error', error: friendlyError(err), extractVersion: EXTRACT_VERSION })
   } finally {
     running.delete(id)
     void closePdf(doc)
@@ -142,7 +144,12 @@ export async function resumeProcessing() {
     if (book.status === 'processing') await processBook(book.id)
   }
   for (const book of books) {
-    if (book.status === 'ready' && (book.extractVersion ?? 1) < EXTRACT_VERSION) await processBook(book.id)
+    const outdated = (book.extractVersion ?? 1) < EXTRACT_VERSION
+    if (!outdated) continue
+    // Ready books get better text; failed books get another try, since a
+    // newer version may fix what went wrong (once per version, no loops).
+    if (book.status === 'ready') await processBook(book.id)
+    else if (book.status === 'error') await retryBook(book.id)
   }
 }
 
@@ -187,9 +194,6 @@ function friendlyError(err: unknown): string {
   }
   if (name === 'InvalidPDFException' || /invalid pdf|unexpected end|missing pdf/i.test(message)) {
     return 'This file is incomplete or damaged — it may not have finished downloading or saving. Try saving or downloading it again.'
-  }
-  if (/is not a function|is not defined/i.test(message)) {
-    return `This browser is too old to open PDFs here. On iPhone, update to iOS 17.4 or newer. (${message})`
   }
   return `This PDF couldn’t be read. (${message})`
 }

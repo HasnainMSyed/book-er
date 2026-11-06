@@ -1,3 +1,5 @@
+// Must come first: fills in features pdf.js needs on iPhone.
+import './polyfills'
 // The legacy build includes fallbacks for older iPhones' Safari engine.
 import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs'
 import type { PDFDocumentProxy, PDFPageProxy, RenderTask } from 'pdfjs-dist/legacy/build/pdf.mjs'

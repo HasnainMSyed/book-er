@@ -37,15 +37,25 @@ export type BookMeta = {
   scannedRatio?: number
   /** Which version of the text extraction prepared this book (missing = 1). */
   extractVersion?: number
-  cover?: Blob
+  /** JPEG bytes (older books may have a Blob). */
+  cover?: Blob | ArrayBuffer
   mode: ReadMode
   progress: Progress
 }
 
 interface BookerDB extends DBSchema {
   books: { key: string; value: BookMeta }
-  files: { key: string; value: Blob }
+  files: { key: string; value: Blob | ArrayBuffer }
   texts: { key: string; value: BookText }
+}
+
+/**
+ * iPhones (WebKit) can refuse to store a picked file or Blob in IndexedDB, so
+ * binary data is saved as raw bytes and turned back into a Blob when read.
+ */
+export function asBlob(data: Blob | ArrayBuffer | undefined, type: string): Blob | undefined {
+  if (data === undefined) return undefined
+  return data instanceof Blob ? data : new Blob([data], { type })
 }
 
 let dbPromise: Promise<IDBPDatabase<BookerDB>> | null = null

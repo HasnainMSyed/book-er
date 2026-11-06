@@ -3,7 +3,7 @@
 // Extracted text and covers are rebuilt on restore, so they aren't included.
 
 import { db, type BookMeta } from './db'
-import { listBooks, processBook } from './library'
+import { getFile, listBooks, processBook } from './library'
 
 const MAGIC = 'BOOKER01'
 
@@ -11,12 +11,11 @@ type HeaderBook = Omit<BookMeta, 'cover' | 'status' | 'processed' | 'error'> & {
 type Header = { app: 'book-er'; version: 1; createdAt: number; books: HeaderBook[] }
 
 export async function createBackup(): Promise<File> {
-  const d = await db()
   const books = await listBooks()
   const parts: Blob[] = []
   const header: Header = { app: 'book-er', version: 1, createdAt: Date.now(), books: [] }
   for (const book of books) {
-    const file = await d.get('files', book.id)
+    const file = await getFile(book.id)
     if (!file) continue
     const { cover: _c, status: _s, processed: _p, error: _e, ...rest } = book
     header.books.push({ ...rest, bytes: file.size })
@@ -51,11 +50,11 @@ export async function restoreBackup(file: File): Promise<{ added: number; skippe
       skipped++
       continue
     }
-    // Copy into memory so the stored file doesn't depend on the backup file.
-    const blob = new Blob([await pdf.arrayBuffer()], { type: 'application/pdf' })
+    // Raw bytes (see asBlob in db.ts), read before the transaction starts.
+    const pdfBytes = await pdf.arrayBuffer()
     const tx = d.transaction(['books', 'files'], 'readwrite')
     await Promise.all([
-      tx.objectStore('files').put(blob, meta.id),
+      tx.objectStore('files').put(pdfBytes, meta.id),
       tx.objectStore('books').put({ ...meta, status: 'processing', processed: 0 }),
       tx.done,
     ])
